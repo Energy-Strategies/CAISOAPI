@@ -4,7 +4,6 @@ cleaned and organized into an excel spreadsheet.
 '''
 
 import math
-import os
 import sys
 import threading
 import time
@@ -88,6 +87,8 @@ def backend(market_run_id, startdate, enddate):
     '''
     node = node_var.get()
     node = node.replace(' ', '')
+    # Nodes in the order the user typed them (used for numbering per-node tabs/charts)
+    node_list = [n for n in node.split(',') if n]
 
     # API Calling Function: returns a raw DataFrame for the given date range, or None on error
     def pull_request(chunk_start, chunk_end):
@@ -173,16 +174,29 @@ def backend(market_run_id, startdate, enddate):
         df = df.drop(columns=['Time', 'Seconds'])
         return df
 
+    # Saves the current matplotlib figure to an in-memory PNG buffer (no temp files)
+    def fig_to_buf():
+        '''
+        This method renders the current matplotlib figure to a BytesIO
+        buffer so it can be embedded directly, avoiding temp .png files.
+        '''
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()  # Closing plt so it doesn't combine with the next chart
+        buf.seek(0)
+        return buf
+
     # Finding interval rows that are missing from the DF and adding in the missing values
-    def fill_missing_values(filename, market_run_id):
+    def build_filled_report(df, market_run_id):
         '''
         This method finds all of the missing intervals not found in the
         df. It fills in the missing values and backfills LMP values.
+        Works entirely in memory and returns the filled report DataFrame.
         '''
         config = get_market_config(market_run_id)
         interval_minutes = config['interval_minutes']
 
-        df = pd.read_excel(filename)
+        df = df.copy()
         # Finding and creating rows for missing intervals
         dt = pd.to_datetime(df['INTERVALSTARTTIME_MST'])
         df['INTERVALSTARTTIME_MST'] = dt.dt.floor(f'{interval_minutes}min')
@@ -191,7 +205,7 @@ def backend(market_run_id, startdate, enddate):
                                    end=df['INTERVALSTARTTIME_MST'].max(),
                                    freq=f'{interval_minutes}min')
         full_df = pd.DataFrame({'INTERVALSTARTTIME_MST': full_range})  # New df for all intervals
-        if 'Greenhouse Gas' in full_df.columns:  # Conditional logic for HASP
+        if 'Greenhouse Gas' in df.columns:  # Conditional logic for HASP (no greenhouse gas)
             result = full_df.merge(
                 df[['INTERVALSTARTTIME_MST', 'INTERVALENDTIME_MST',
                     'NODE', 'Year', 'Month', 'Hour (MST)', 'Minute',
@@ -239,15 +253,22 @@ def backend(market_run_id, startdate, enddate):
             result = result[['INTERVALSTARTTIME_MST', 'INTERVALENDTIME_MST',
                              'NODE', 'Year', 'Month', 'Day', 'Hour (MST)',
                              'Minute', 'LMP','Congestion', 'Energy', 'Loss']]
-        result.to_excel(filename)
+        result = result.reset_index(drop=True)
+        return result
 
-    # Creating the monthly average sheet and chart
-    def monthly_average(filename, df):
+    # Creating the monthly average sheet and chart(s)
+    def compute_monthly(df, ordered_nodes):
+        '''
+        This method computes the (combined) monthly average table and
+        builds the monthly line chart(s). With multiple nodes it returns
+        a group chart (all node lines overlaid) followed by one chart per
+        node. Returns (DataFrame, list of image buffers in stacking order).
+        '''
         df = df.copy()
-        # Create a new column containing month and year (spelled out) and have this be the X axis
+        # Create a new column containing month and year and have this be the X axis
         df['Date'] = df['Month'].astype(str).str.zfill(2) + '/01/' + df['Year'].astype(str)
         df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y')
-        df['Date'] = df['Date'].dt.strftime('%B %Y')  # Prints date spelled out (May 2024)
+        df['Date'] = df['Date'].dt.strftime('%m %Y')  # Prints date as month + year (05 2024)
         df = df.sort_values(['Year', 'Month']) # sorts first by year, then by month
 
         if 'Greenhouse Gas' in df.columns:
@@ -263,81 +284,87 @@ def backend(market_run_id, startdate, enddate):
             df_avg = df_avg[['NODE', 'Year', 'Month', 'Date', 'LMP',
                              'Congestion', 'Energy', 'Loss']]
 
-        # Adding sheet to excel file
-        with pd.ExcelWriter(f'{output_file_path}/{market_run_id} {timestamp}.xlsx',
-                            engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-            df_avg.to_excel(writer, sheet_name='Monthly Average', index=False)
-        plt.figure(figsize=(10,8))
-        plt.plot(df_avg['Date'], df_avg['LMP'])  # Creating monthly average line chart
-        plt.tick_params(axis='x', labelrotation=45)
-        plt.grid()
-        plt.title(f'Monthly Average LMP {node}')
-        plt.ylabel('Avg $/MWh')
-        plt.xlabel('Month')
-        plt.savefig(f'{output_file_path}/monthlyline.png')
-        plt.close()  # Closing plt so it doesn't combine with other chart later
-        img_path = f'{output_file_path}/monthlyline.png'
-        add_chart_to_excel(filename, 'Monthly Average', img_path, 'J1')
+        # Draws a single node's monthly line, or all nodes overlaid for the group chart
+        def draw_monthly(title, overlay=False):
+            plt.figure(figsize=(10,8))
+            if overlay:
+                for n in ordered_nodes:
+                    node_df = df_avg[df_avg['NODE'] == n]
+                    plt.plot(node_df['Date'], node_df['LMP'], label=n)
+                plt.legend()
+            else:
+                node_df = df_avg[df_avg['NODE'] == title_node]
+                plt.plot(node_df['Date'], node_df['LMP'])
+            plt.tick_params(axis='x', labelrotation=45)
+            plt.grid()
+            plt.title(title)
+            plt.ylabel('Avg $/MWh')
+            plt.xlabel('Month')
+            plt.tight_layout()
+            return fig_to_buf()
 
-        format_excel_cells('Monthly Average', 4, 10)  # Calling number formatting function
+        imgs = []
+        if len(ordered_nodes) > 1:
+            imgs.append(draw_monthly('Monthly Average LMP - All Nodes', overlay=True))
+            for n in ordered_nodes:
+                title_node = n
+                imgs.append(draw_monthly(f'Monthly Average LMP {n}'))
+        else:
+            title_node = ordered_nodes[0]
+            imgs.append(draw_monthly(f'Monthly Average LMP {title_node}'))
+        return df_avg, imgs
 
-    # Creating hourly average sheet and heatmap
-    def hourly_average(filename, df):
+    # Creating hourly average sheet and heatmap(s)
+    def compute_hourly(df, ordered_nodes):
         '''
-        This method takes the hourly average of the main report and
-        adds it to a new sheet. It also includes a heatmap for the
-        12X24 data, averaging multiple years.
+        This method takes the (combined) hourly average of the main report
+        and builds the 12x24 heatmap(s). With multiple nodes it returns a
+        group heatmap (all nodes averaged) followed by one per node.
+        Returns (DataFrame, group below-zero count, {node: count}, list of
+        image buffers in stacking order).
         '''
         df = df.copy()
         if 'Greenhouse Gas' in df.columns:
-            df_avg = df.groupby(['NODE', 'Date', 'Day', 'Hour (MST)'],
+            df_avg = df.groupby(['NODE', 'Year', 'Month', 'Day', 'Hour (MST)'],
                                 as_index=False)[['Congestion', 'Energy', 'Greenhouse Gas', 'LMP',
                                                  'Loss']].mean()
-            df_avg[['Congestion', 'Energy', 'Loss', 'Greenhouse Gas',
-                    'LMP']] = df_avg[['Congestion', 'Energy', 'Loss', 'Greenhouse Gas', 'LMP']]
             df_avg = df_avg[['NODE', 'Year', 'Month', 'Day', 'Hour (MST)', 'Congestion', 'Energy',
                              'Greenhouse Gas', 'Loss', 'LMP']]  # Reordering column names
         else:
             df_avg = df.groupby(['NODE', 'Year', 'Month', 'Day', 'Hour (MST)'],
                                 as_index=False)[['Congestion', 'Energy', 'LMP', 'Loss']].mean()
-            df_avg[['Congestion', 'Energy', 'Loss','LMP']] = df_avg[['Congestion', 'Energy',
-                                                                     'Loss', 'LMP']]
             df_avg = df_avg[['NODE', 'Year', 'Month', 'Day', 'Hour (MST)', 'Congestion', 'Energy',
                              'Loss', 'LMP']]
 
-        count = (df_avg['LMP'] < 0).sum()  # Counting how many hours LMP is below 0
+        # Counting how many hours LMP is below 0, for the group and for each node
+        count = (df_avg['LMP'] < 0).sum()
+        per_node_counts = {n: int((df_avg.loc[df_avg['NODE'] == n, 'LMP'] < 0).sum())
+                           for n in ordered_nodes}
 
-        with pd.ExcelWriter(f'{output_file_path}/{market_run_id} {timestamp}.xlsx',
-                            engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-            # Writing hourly averages sheet
-            df_avg.to_excel(writer, sheet_name='Hourly Average', index=False)
-            row = 13  # Adding blank rows in between
-            pd.DataFrame([['Number of hours LMP is below 0:']]).to_excel(writer,
-                sheet_name='Summary Statistics', startrow=row, header=False, index=False)
-            row += 1
-            pd.DataFrame([[count]]).to_excel(writer, sheet_name='Summary Statistics',
-                                             startrow=row, header=False, index=False)
-            row += 2
-            pd.DataFrame([['Duration Curve']]).to_excel(writer, sheet_name='Summary Statistics',
-                                                        startrow=row, header=False, index=False)
-            row += 1
+        # Draws a 12x24 heatmap for the given (possibly node-filtered) data
+        def draw_heatmap(sub_df, title):
+            pivot = sub_df.pivot_table(index='Hour (MST)', columns='Month',
+                                       values='LMP', aggfunc='mean')
+            plt.figure(figsize=(10,8))
+            sns.heatmap(pivot, annot=True, cmap='RdYlGn_r', fmt='.0f', cbar_kws={'label':'$/MWH'})
+            plt.title(title)
+            plt.tight_layout()
+            return fig_to_buf()
 
-        # Heat map logic
-        pivot = df.pivot_table(index='Hour (MST)', columns='Month', values='LMP', aggfunc='mean')
-        plt.figure(figsize=(10,8))
-        sns.heatmap(pivot, annot=True, cmap='RdYlGn_r', fmt='.0f', cbar_kws={'label':'$/MWH'})
-        plt.title(f'12x24 Heatmap {node}')
-        plt.savefig(f'{output_file_path}/heatmap.png')
-        plt.close()
-        img_path = f'{output_file_path}/heatmap.png'
-        add_chart_to_excel(filename, 'Hourly Average', img_path, 'L3')  # Adding chart to excel
-        format_excel_cells('Hourly Average', 6,10)  # Calling number formatting function
+        imgs = []
+        if len(ordered_nodes) > 1:
+            imgs.append(draw_heatmap(df, '12x24 Heatmap - All Nodes'))
+            for n in ordered_nodes:
+                imgs.append(draw_heatmap(df[df['NODE'] == n], f'12x24 Heatmap {n}'))
+        else:
+            imgs.append(draw_heatmap(df, f'12x24 Heatmap {ordered_nodes[0]}'))
+        return df_avg, count, per_node_counts, imgs
 
-    # Creating summary statistics sheet
-    def summary_statistics(filename, df):
+    # Creating summary statistics table
+    def compute_summary(df):
         '''
-        This method creates a new sheet depicting summary stats for
-        the four LMP values.
+        This method computes summary stats for the four LMP values and
+        returns the describe() DataFrame.
         '''
         if 'Greenhouse Gas' in df.columns:
             cols = ['Congestion', 'Energy', 'Loss', 'Greenhouse Gas', 'LMP']
@@ -345,26 +372,14 @@ def backend(market_run_id, startdate, enddate):
             cols = ['Congestion', 'Energy', 'Loss', 'LMP']
         desc = df[cols].describe()  # Finding what I want to display
         desc = desc.round(4)
+        return desc
 
-        with pd.ExcelWriter(f'{output_file_path}/{market_run_id} {timestamp}.xlsx',
-                            engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-            row = 0
-            pd.DataFrame([['Summary Statistics']]).to_excel(writer,
-                                                            sheet_name='Summary Statistics',
-                                                            startrow=row, header=False,
-                                                            index=False)
-            row += 1
-            desc.to_excel(writer, sheet_name = 'Summary Statistics', startrow=row, header=True,
-                          index=True)
-            row += 13
-
-        format_excel_cells('Summary Statistics', 2, 5)  # Calling number formatting function
-
-    # Creating duration charts and adding them to the sheet
-    def duration_chart(filename, df):
+    # Creating duration charts and the hidden data they plot from
+    def compute_duration(df, label):
         '''
         This method creates a duration chart for the entire report, as
-        well as two zoomed charts, for the first and last 5%.
+        well as two zoomed charts, for the first and last 5%. Returns
+        (hidden-data DataFrame, list of (image buffer, cell) tuples).
         '''
         # Cleaning to get chart columns
         df = df.copy().sort_values('LMP', ascending=False)
@@ -378,88 +393,51 @@ def backend(market_run_id, startdate, enddate):
         df['xval'] = df['LMP'].map(xval_map)
         df = df[['LMP', 'xval']]
 
-        # Writing the new df to a sheet and hiding it
-        with pd.ExcelWriter(f'{output_file_path}/{market_run_id} {timestamp}.xlsx',
-                            engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-            df.to_excel(writer, sheet_name='Hidden Duration Chart Data', index=False)
-        wb = openpyxl.load_workbook(filename)
-        ws = wb['Hidden Duration Chart Data']
-        ws.sheet_state='hidden'  # Hiding the sheet
-
-        # Page formatting, bolding titles
-        sheet = wb['Summary Statistics']
-        sheet['A1'].font = Font(bold=True)
-        sheet['A14'].font = Font(bold=True)
-        sheet['A17'].font = Font(bold=True)
-        sheet['M17'].font = Font(bold=True)
-
-        wb.save(filename)
+        duration_imgs = []  # (image buffer, target cell) tuples, embedded during the write phase
 
         # Creating duration chart
         plt.figure()
         plt.scatter(df['xval'], df['LMP'], s=3)
         plt.axhline(y=0, color ='black')  # Creating 0 axis line
-        plt.title(f'Duration Chart {node}')
+        plt.title(f'Duration Chart {label}')
         plt.ylabel('$/MWh')
         plt.xlabel('% of Time')
         plt.grid()
-        plt.savefig(f'{output_file_path}/durationchart.png')  # Creating an image of the chart
-        plt.close()
-        img_path2 = f'{output_file_path}/durationchart.png'
-        add_chart_to_excel(filename, 'Summary Statistics', img_path2, 'B19')
+        duration_imgs.append((fig_to_buf(), 'B19'))
 
         # Creating lowest 5% zoom
         last5 = df.tail(int(len(df)*.05))
         plt.figure()
         plt.scatter(last5['xval'], last5['LMP'], s=3)
         plt.axhline(y=0, color='black')
-        plt.title(f'Lowest 5% Zoom {node}')
+        plt.title(f'Lowest 5% Zoom {label}')
         plt.ylabel('$/MWh')
         plt.xlabel('% of Time')
         plt.grid()
-        plt.savefig(f'{output_file_path}/lowest5zoom.png')
-        plt.close()
-        img_path = f'{output_file_path}/lowest5zoom.png'
-        add_chart_to_excel(filename, 'Summary Statistics', img_path, 'L46')
+        duration_imgs.append((fig_to_buf(), 'L46'))
 
         # Creating highest 5% zoom
         first5 = df.head(int(len(df)*.05))
         plt.figure()
         plt.scatter(first5['xval'], first5['LMP'], s=3)
         plt.axhline(y=0, color='black')
-        plt.title(f'Highest 5% Zoom {node}')
+        plt.title(f'Highest 5% Zoom {label}')
         plt.ylabel('$/MWh')
         plt.xlabel('% of Time')
         plt.grid()
-        plt.savefig(f'{output_file_path}/highest5zoom.png')
-        plt.close()
-        img_path3 = f'{output_file_path}/highest5zoom.png'
-        add_chart_to_excel(filename, 'Summary Statistics', img_path3, 'B46')
+        duration_imgs.append((fig_to_buf(), 'B46'))
 
-    # Formats all numbers in called rows to have two decimal places
-    def format_excel_cells(sheet, min_col, max_col):
+        return df, duration_imgs
+
+    # Formats all numbers in the given column range to have two decimal places
+    def format_number_cells(ws, min_col, max_col):
         '''
-        This method formats the numerical values to two decimal places.
+        This method formats the numerical values to two decimal places
+        on an already-open worksheet object.
         '''
-        wb = openpyxl.load_workbook(file)
-        sheet = wb[sheet]
-        for row in sheet.iter_rows(min_col=min_col, max_col=max_col, min_row=2):
+        for row in ws.iter_rows(min_col=min_col, max_col=max_col, min_row=2):
             for cell in row:
                 cell.number_format = '0.00'
-        wb.save(file)
-
-    # Adding created chart to excel file
-    def add_chart_to_excel(filename, sheet_name, chart_path, cell_reference):
-        '''
-        This method saves the python chart to an image and adds it to
-        the excel sheet.
-        '''
-        wb = openpyxl.load_workbook(file)
-        sheet = wb[sheet_name]
-        img = XLImage(chart_path)
-        sheet.add_image(img, cell_reference)
-        wb.save(filename)
-        os.remove(chart_path)
 
     # Returning the appropriate LMP columns based on market_run_id
     def get_lmp_columns(has_greenhouse_gas=True):
@@ -488,6 +466,9 @@ def backend(market_run_id, startdate, enddate):
     api_market_run_id = config.get('api_market_run_id', market_run_id)
     startdate = datetime.strptime(startdate, '%m/%d/%y').date()
     enddate = datetime.strptime(enddate, '%m/%d/%y').date()
+    # Filename-safe date labels (captured before enddate +1 and before the loop mutates startdate)
+    start_label = startdate.strftime('%m-%d-%Y')
+    end_label = enddate.strftime('%m-%d-%Y')
     enddate = enddate + timedelta(days=1)  # Adding on a day to pull so it gets the full last day
     difference = enddate - startdate
     days = difference.days  # Making a counter for my loop bc .days is readonly
@@ -551,35 +532,105 @@ def backend(market_run_id, startdate, enddate):
                                             'Minute'], columns='LMP_TYPE').reset_index()
         df_combined = df_combined[get_ordered_columns(has_greenhouse_gas)]
 
-    # Writing report to Excel
-    update_status('Writing report to Excel...')
-    file = f'{output_file_path}/{market_run_id} {timestamp}.xlsx'
-    with pd.ExcelWriter(file, engine='openpyxl') as writer:
-        df_combined.to_excel(writer, sheet_name='Report', index=False)
-
+    # Fill missing intervals in memory (no Excel round-trips)
     update_status('Filling missing intervals...')
-    fill_missing_values(file, market_run_id)
+    df_report = build_filled_report(df_combined, market_run_id)
 
-    # Read the filled report once and pass it to all analysis functions
-    df_report = pd.read_excel(file)
+    # Node order as typed, keeping only nodes actually present in the returned data
+    report_nodes = list(df_report['NODE'].astype(str).unique())
+    ordered_nodes = [n for n in node_list if n in report_nodes]
+    ordered_nodes += [n for n in report_nodes if n not in ordered_nodes]  # defensive
+    if not ordered_nodes:
+        ordered_nodes = report_nodes
+    multi_node = len(ordered_nodes) > 1
 
+    # Build every analysis table + chart in memory before touching Excel
     update_status('Generating Monthly Average...')
-    monthly_average(file, df_report)
+    df_monthly, monthly_imgs = compute_monthly(df_report, ordered_nodes)
 
     update_status('Generating Hourly Average...')
-    hourly_average(file, df_report)
+    df_hourly, below_zero_count, per_node_counts, heatmap_imgs = compute_hourly(
+        df_report, ordered_nodes)
 
     update_status('Generating Summary Statistics...')
-    summary_statistics(file, df_report)
+    group_label = 'All Nodes' if multi_node else ordered_nodes[0]
+    desc = compute_summary(df_report)
 
     update_status('Generating Duration Charts...')
-    duration_chart(file, df_report)
+    df_duration, duration_imgs = compute_duration(df_report, group_label)
 
-    format_excel_cells('Sheet1', 10, 14)  # Formatting numbers on first sheet
-    wb = openpyxl.load_workbook(file)
-    sheet = wb['Sheet1']
-    sheet.title='Report'  # Renaming the first sheet
-    wb.save(file)
+    # Per-node summary pages (only when more than one node — otherwise the group IS the node)
+    node_pages = []  # (tab_name, node_name, desc, below-zero count, duration image list)
+    if multi_node:
+        for i, n in enumerate(ordered_nodes, start=1):
+            update_status(f'Generating Summary Statistics for {n}...')
+            node_df = df_report[df_report['NODE'].astype(str) == n]
+            node_desc = compute_summary(node_df)
+            _, node_dur_imgs = compute_duration(node_df, n)
+            node_pages.append((f'Summary Statistics - Node {i}', n, node_desc,
+                               per_node_counts.get(n, 0), node_dur_imgs))
+
+    # Writes the shared Summary-Statistics page layout onto an already-created sheet
+    def decorate_summary_sheet(ws, count, dur_imgs, node_label):
+        ws['A1'] = 'Summary Statistics'
+        ws['B1'] = node_label  # Node name next to the title
+        ws['A14'] = 'Number of hours LMP is below 0:'
+        ws['A15'] = int(count)
+        ws['A17'] = 'Duration Curve'
+        for img_buf, cell_ref in dur_imgs:
+            ws.add_image(XLImage(img_buf), cell_ref)
+        for coord in ('A1', 'B1', 'A14', 'A17', 'M17'):
+            ws[coord].font = Font(bold=True)
+        format_number_cells(ws, 2, 6)
+
+    # Stacks a list of chart buffers vertically down one column
+    def stack_images(ws, buffers, col, start_row, step=42):
+        for idx, buf in enumerate(buffers):
+            ws.add_image(XLImage(buf), f'{col}{start_row + idx * step}')
+
+    # Single-pass write: assemble the whole workbook in memory, then save once.
+    # This replaces ~20 openpyxl load/save cycles (which re-serialized every
+    # embedded chart each time) with one serialization.
+    update_status('Writing report to Excel...')
+    file = f'{output_file_path}/{market_run_id} {start_label} to {end_label} ({timestamp}).xlsx'
+    with pd.ExcelWriter(file, engine='openpyxl') as writer:
+        df_report.to_excel(writer, sheet_name='Report', index=False)
+        df_monthly.to_excel(writer, sheet_name='Monthly Average', index=False)
+        df_hourly.to_excel(writer, sheet_name='Hourly Average', index=False)
+        desc.to_excel(writer, sheet_name='Summary Statistics', startrow=1,
+                      header=True, index=True)
+        for tab_name, _, node_desc, _, _ in node_pages:
+            node_desc.to_excel(writer, sheet_name=tab_name, startrow=1,
+                               header=True, index=True)
+        df_duration.to_excel(writer, sheet_name='Hidden Duration Chart Data', index=False)
+
+        ws_report = writer.sheets['Report']
+        ws_monthly = writer.sheets['Monthly Average']
+        ws_hourly = writer.sheets['Hourly Average']
+        ws_summary = writer.sheets['Summary Statistics']
+        ws_duration = writer.sheets['Hidden Duration Chart Data']
+
+        # Group Summary Statistics page
+        decorate_summary_sheet(ws_summary, below_zero_count, duration_imgs, group_label)
+
+        # Per-node Summary Statistics pages
+        for tab_name, node_name, _, node_count, node_dur_imgs in node_pages:
+            decorate_summary_sheet(writer.sheets[tab_name], node_count,
+                                   node_dur_imgs, node_name)
+
+        # Embedding the monthly/hourly charts, stacked (group first, then per node)
+        stack_images(ws_monthly, monthly_imgs, 'J', 1)
+        stack_images(ws_hourly, heatmap_imgs, 'L', 3)
+
+        # Hiding the raw duration-curve data sheet
+        ws_duration.sheet_state = 'hidden'
+
+        # Number formatting (two decimals) on the price columns. Ranges cover the
+        # optional Greenhouse Gas column; on markets without it the extra column is
+        # empty and formatting it is harmless.
+        format_number_cells(ws_monthly, 4, 10)
+        format_number_cells(ws_hourly, 6, 10)
+        format_number_cells(ws_report, 9, 13)
 
     root.after(0, lambda: (
         status_lbl.configure(text='Finished!'),
