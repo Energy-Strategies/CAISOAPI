@@ -27,7 +27,8 @@ from openpyxl.styles import Font
 from pydantic import ValidationError
 
 from tkcalendar import Calendar
-from customtkinter import CTk, CTkButton, CTkLabel, CTkComboBox, CTkEntry, set_appearance_mode
+from customtkinter import (CTk, CTkButton, CTkLabel, CTkComboBox, CTkEntry,
+                           CTkCheckBox, set_appearance_mode)
 
 # =============================================================================
 # CONSTANTS AND CONFIGURATION
@@ -78,12 +79,14 @@ def get_market_config(market_run_id):
 # =============================================================================
 # DATA PROCESSING FUNCTION
 # =============================================================================
-def backend(market_run_id, startdate, enddate):
+def backend(market_run_id, startdate, enddate, include_ghg=True):
     '''
     This method runs everything the GUI does after the submit button
     is pressed. It calls the API, pulls the cleaned data into an
     excel file, and adds 3 analysis sheets: hourly average, monthly
-    average, and summary statistics
+    average, and summary statistics. When include_ghg is False, the
+    Greenhouse Gas component is subtracted out of LMP (and the columns
+    are relabeled) rather than counted toward it.
     '''
     node = node_var.get()
     node = node.replace(' ', '')
@@ -536,6 +539,21 @@ def backend(market_run_id, startdate, enddate):
     update_status('Filling missing intervals...')
     df_report = build_filled_report(df_combined, market_run_id)
 
+    # Greenhouse Gas handling. CAISO reports LMP as the total, i.e.
+    # LMP = Energy + Congestion + Loss + GHG. If the user unchecked "Include GHG",
+    # subtract the GHG component back out of LMP so every downstream table/chart
+    # reflects LMP excluding GHG. The GHG values are kept (never re-pulled) and the
+    # columns are relabeled on output so the exclusion is visible.
+    exclude_ghg = ('Greenhouse Gas' in df_report.columns) and not include_ghg
+    if exclude_ghg:
+        df_report['LMP'] = df_report['LMP'] - df_report['Greenhouse Gas']
+        out_rename = {'LMP': 'LMP excluding GHG', 'Greenhouse Gas': 'GHG - Not Included'}
+    else:
+        out_rename = {}
+
+    def out(frame):  # Applies the GHG relabeling to a DataFrame just before writing
+        return frame.rename(columns=out_rename) if out_rename else frame
+
     # Node order as typed, keeping only nodes actually present in the returned data
     report_nodes = list(df_report['NODE'].astype(str).unique())
     ordered_nodes = [n for n in node_list if n in report_nodes]
@@ -592,17 +610,17 @@ def backend(market_run_id, startdate, enddate):
     # This replaces ~20 openpyxl load/save cycles (which re-serialized every
     # embedded chart each time) with one serialization.
     update_status('Writing report to Excel...')
-    file = f'{output_file_path}/{market_run_id} {start_label} to {end_label} ({timestamp}).xlsx'
+    file = f'{output_file_path}/{market_run_id} LMP {start_label} to {end_label} ({timestamp}).xlsx'
     with pd.ExcelWriter(file, engine='openpyxl') as writer:
-        df_report.to_excel(writer, sheet_name='Report', index=False)
-        df_monthly.to_excel(writer, sheet_name='Monthly Average', index=False)
-        df_hourly.to_excel(writer, sheet_name='Hourly Average', index=False)
-        desc.to_excel(writer, sheet_name='Summary Statistics', startrow=1,
-                      header=True, index=True)
+        out(df_report).to_excel(writer, sheet_name='Report', index=False)
+        out(df_monthly).to_excel(writer, sheet_name='Monthly Average', index=False)
+        out(df_hourly).to_excel(writer, sheet_name='Hourly Average', index=False)
+        out(desc).to_excel(writer, sheet_name='Summary Statistics', startrow=1,
+                           header=True, index=True)
         for tab_name, _, node_desc, _, _ in node_pages:
-            node_desc.to_excel(writer, sheet_name=tab_name, startrow=1,
-                               header=True, index=True)
-        df_duration.to_excel(writer, sheet_name='Hidden Duration Chart Data', index=False)
+            out(node_desc).to_excel(writer, sheet_name=tab_name, startrow=1,
+                                    header=True, index=True)
+        out(df_duration).to_excel(writer, sheet_name='Hidden Duration Chart Data', index=False)
 
         ws_report = writer.sheets['Report']
         ws_monthly = writer.sheets['Monthly Average']
@@ -651,8 +669,9 @@ def submit():
     sub_btn.configure(state='disabled')
     update_status('Starting...')
     market_run_id = MRIDDropdown.get()  # Grabbing market_run_id based on user input
+    include_ghg = ghg_var.get()  # Whether GHG is counted toward LMP
     t = threading.Thread(
-        target=lambda: backend(market_run_id, startdate, enddate),
+        target=lambda: backend(market_run_id, startdate, enddate, include_ghg),
         daemon=True
     )
     t.start()
@@ -693,6 +712,11 @@ def update_report_lbl(choice):
     report_name = config.get('report_name', 'Unknown Report')
 
     report_lbl.configure(text=f'{report_name}')
+    # Disable the GHG checkbox for markets without a GHG component (e.g., HASP)
+    if config.get('has_greenhouse_gas', False):
+        ghg_checkbox.configure(state='normal')
+    else:
+        ghg_checkbox.configure(state='disabled')
     root.update()
 
 
@@ -704,6 +728,7 @@ root.geometry('800x600')
 set_appearance_mode('light')
 
 node_var = tk.StringVar()
+ghg_var = tk.BooleanVar(value=True)  # Include Greenhouse Gas in LMP (default: yes)
 
 startdate = None  # Initializing
 enddate = None
@@ -733,6 +758,10 @@ enddate_label = CTkLabel(root, text='End Date: ', font=('Arial', 15), text_color
 node_label = CTkLabel(root, text='Node(s):', font=('Arial', 15), text_color='#04033A')
 node_entry = CTkEntry(root, textvariable = node_var, font=('Arial', 15), text_color='#04033A', width=300)
 
+ghg_checkbox = CTkCheckBox(root, text='Include Greenhouse Gas in LMP', variable=ghg_var,
+                           onvalue=True, offvalue=False, font=('Arial', 13),
+                           text_color='#04033A', fg_color='#162157', hover_color='#6D7DCF')
+
 sub_btn=CTkButton(master=root,text = 'Submit', command=submit, corner_radius=32,
                   fg_color='#162157', hover_color='#6D7DCF')
 
@@ -756,6 +785,7 @@ MRID_label.grid(row=1, column=1)
 MRIDDropdown.grid(row=1, column=2)
 node_label.grid(row=3, column=1)
 node_entry.grid(row=3, column=2)
+ghg_checkbox.grid(row=4, column=2)
 sub_btn.grid(row=6, column=2)
 startdate_label.grid(row=4, column=1)
 enddate_label.grid(row=5, column=1)

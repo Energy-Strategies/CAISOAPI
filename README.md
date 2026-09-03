@@ -34,17 +34,19 @@ Tutorial Video (click to watch):
 - Separate multiple nodes with a comma (e.g., NODE1,NODE2,NODE3).
 - Each report query returns the raw data, monthly averages, hourly averages, and summary statistics.
 - With multiple nodes, each node also gets its own monthly/hourly charts and a dedicated summary statistics tab, alongside the combined group view.
+- Use the "Include Greenhouse Gas in LMP" checkbox to control whether the GHG component counts toward LMP. When unchecked, GHG is subtracted from LMP everywhere and the columns are relabeled ("LMP excluding GHG" and "GHG - Not Included") so the component stays visible and can be added back without re-pulling. The checkbox is disabled for markets without GHG (HASP).
 - Please be patient; some reports, especially RTM, may take longer to process.
 - Data is processed entirely in memory — no temporary files are created on disk.
 
 
-## Version History -- Last updated: September 2026 (version 4.0) 
+## Version History -- Last updated: September 2026 (version 4.1) 
 - v1.0: Initial release - basic report retrieval
 - v2.0: Added summary and analysis pages
 - v2.1: Tweaked analysis pages for improved insights
 - v2.2: Added data visualizations
 - v3.0: Added progress tracking and improved code efficiency — removed partial file saves, allowing partial data to exist in memory
 - v4.0: Faster Excel export (workbook assembled in memory and saved once, instead of repeated re-saves); per-node monthly/hourly charts and per-node summary statistics tabs; descriptive output filenames (market + date range + timestamp); bug fixes (Greenhouse Gas column no longer dropped, removed stray index column)
+- v4.1: Added a checkbox to include/exclude Greenhouse Gas in the LMP calculation (unchecked subtracts GHG from LMP and relabels the columns; disabled for HASP)
 
 ## License
 This project is licensed under the [MIT License](LICENSE).
